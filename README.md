@@ -1,8 +1,8 @@
 # owblock
 
-A simple terminal-based server selector for Overwatch on Linux, uses firewall rules to block servers you don't want to play on.
+Terminal-based server selector for Overwatch on Linux, uses firewall rules to block servers you don't want to play on.
 
-Concept and ip ranges yoinked from this project: [stowmyy/dropship](https://github.com/stowmyy/dropship).
+Concept and ip ranges yoinked from this awseome project: [stowmyy/dropship](https://github.com/stowmyy/dropship).
 
 <img width="1099" height="728" alt="screenshot" src="https://github.com/user-attachments/assets/d72689fb-b608-4349-bea3-d5aabc5b57f4" />
 
