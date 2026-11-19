@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""owblock - choose which Overwatch servers you connect to, on Linux.
+
+Blocks the servers you don't want with an nftables firewall table, so
+matchmaking can only put you on the ones you do. Server IP ranges come from
+the list published by dropship (https://github.com/stowmyy/dropship).
+
+Needs python 3.6+, nftables 0.9+, and sudo or doas (or run as root).
+"""
+
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+# ── config ──────────────────────────────────────────────────────────────────
+
+API_URL = "https://stowmyy.github.io/dropship/ips.json"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "owblock" / "ips.json"
+TABLE = "owblock"  # nftables table name (family inet)
+PROG = Path(sys.argv[0]).name
+
+# ── style ────────────────────────────────────────────────────────
+
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _sgr(code):
+    return lambda t: f"\033[{code}m{t}\033[0m" if _COLOR else str(t)
+
+
+def _rgb(hexcode):
+    r, g, b = (int(hexcode[i:i + 2], 16) for i in (0, 2, 4))
+    return _sgr(f"38;2;{r};{g};{b}")
+
+
+bold = _sgr("1")
+orange = _rgb("f99e1a")
+white = _rgb("f4f6f8")
+dim = _rgb("6b7a89")
+blue = _rgb("4fb3ff")
+green = _rgb("5fd38d")
+yellow = _rgb("f5c84c")
+red = _rgb("ff5c5c")
+OK, NO = green("●"), red("✕")
+
+EMBLEM = """\
+            .-=++++=-.
+        :+%@@@@@@@@@@@@%+:
+       -@@@@%*++++++*%@@@@-
+    +%= .*=.          .=*. =%+
+   #@@@*                  *@@@#
+  %@@@+                .=*@@@@@%
+ +@@@*             .=*@@@@@%%@@@+
+ %@@@          .-*%@@@@%+-   @@@%
+ @@@%      .-*%@@@@%*-.      %@@@
+ %@@@   -+%@@@@%*-.          @@@%
+ +@@@%%@@@@@*=.             *@@@+
+  %@@@@@*=.                +@@@%
+   #@@@#.                .#@@@#
+    +@@@@#=.          .=#@@@@+
+     .+@@@@@%*++++++*%@@@@@+.
+        :+%@@@@@@@@@@@@%+:
+            .-=++++=-.
+"""
+# o = orange, w = white
+EMBLEM_MASK = """\
+            oooooooooo
+        oooooooooooooooooo
+       oooooooooooooooooooo
+    www oooo          oooo www
+   wwwww                  wwwww
+  wwwww                wwwwwwwww
+ wwwww             wwwwwwwwwwwwww
+ wwww          wwwwwwwwwww   wwww
+ wwww      wwwwwwwwwwww      wwww
+ wwww   wwwwwwwwwww          wwww
+ wwwwwwwwwwwwww             wwwww
+  wwwwwwwww                wwwww
+   wwwwww                wwwwww
+    wwwwwwww          wwwwwwww
+     wwwwwwwwwwwwwwwwwwwwwwww
+        wwwwwwwwwwwwwwwwww
+            wwwwwwwwww
+"""
+
+
+def emblem(indent="  "):
+    for line, mask in zip(EMBLEM.splitlines(), EMBLEM_MASK.splitlines()):
+        out = "".join(
+            (orange if m == "o" else white)(ch) if ch != " " else " "
+            for ch, m in zip(line, mask.ljust(len(line)))
+        )
+        print(indent + out)
+
+
+def pad(text, plain, width, right=False):
+    """Pad coloured text by the width of its plain form."""
+    gap = " " * max(0, width - len(plain))
+    return gap + text if right else text + gap
+
+
+def pretty(title):
+    return title.title().replace("Usa", "USA")
+
+
+def _ping_style(ms):
+    return green if ms < 80 else yellow if ms < 160 else red
+
+
+def ping_text(ms):
+    """Return (coloured, plain) ping text."""
+    if ms is None:
+        return dim("—"), "—"
+    t = f"{ms}ms"
+    return _ping_style(ms)(t), t
+
+
+def ping_bar(ms, width=12):
+    if ms is None:
+        return dim("·" * width)
+    n = max(1, min(width, round(ms / 300 * width)))
+    return _ping_style(ms)("━" * n) + dim("·" * (width - n))
+
+
+def die(msg):
+    print(f"{red(bold('✕'))} {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ── server list ─────────────────────────────────────────────────────────────
+
+def fetch(force=False):
+    """Download the server list, falling back to the cached copy on failure."""
+    try:
+        req = urllib.request.Request(API_URL, headers={"User-Agent": "owblock"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r)
+        data["servers"]["overwatch"]  # sanity check shape
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE.write_text(json.dumps(data))
+    except Exception as e:
+        if force or not CACHE.exists():
+            die(f"could not download server list: {e}")
+        print(f"{yellow('!')} download failed ({e}), using cached list", file=sys.stderr)
+        data = json.loads(CACHE.read_text())
+    return data["servers"]["overwatch"]
+
+
+def cached_servers():
+    if CACHE.exists():
+        return json.loads(CACHE.read_text())["servers"]["overwatch"]
+    return None
+
+
+def resolve(servers, names):
+    by_token = {s["token"]: s for s in servers}
+    unknown = [n for n in names if n not in by_token]
+    if unknown:
+        die(f"unknown server(s): {', '.join(unknown)} (see `{PROG} list`)")
+    return [by_token[n] for n in names]
+
+
+def ping(ip):
+    """Round-trip time in ms, or None if there's no reply within a second."""
+    r = subprocess.run(["ping", "-c", "1", "-W", "1", ip], capture_output=True, text=True)
+    for part in r.stdout.split():
+        if part.startswith("time="):
+            return round(float(part[5:]))
+    return None
+
+
+# ── firewall ────────────────────────────────────────────────────────────────
+#
+# Everything lives in one table, `inet owblock`, which is replaced wholesale on
+# each change. Only outbound UDP to ports 1024-65535 is dropped (game traffic),
+# so websites hosted in the same cloud regions keep working. The blocked server
+# tokens are stored in the drop rule's comment so `status` can read them back.
+# Nothing is persistent: a reboot or `owblock off` clears it.
+
+def priv(cmd, interactive=True):
+    """Prefix cmd with sudo or doas when not already root."""
+    if os.geteuid() == 0:
+        return cmd
+    for tool in ("sudo", "doas"):
+        if shutil.which(tool):
+            return [tool] + ([] if interactive else ["-n"]) + cmd
+    die("need root: run as root, or install sudo or doas")
+
+
+def nft(script):
+    r = subprocess.run(priv(["nft", "-f", "-"]), input=script, text=True)
+    if r.returncode:
+        die("nft failed")
+
+
+def remove_table():
+    # Creating then deleting means this never fails if the table is absent.
+    nft(f"table inet {TABLE} {{}}\ndelete table inet {TABLE}\n")
+
+
+def blocked_tokens():
+    """Tokens currently blocked, [] if none, or None if unknown.
+
+    None means the table doesn't exist, or root isn't available without a
+    password prompt.
+    """
+    r = subprocess.run(priv(["nft", "list", "table", "inet", TABLE], interactive=False),
+                       capture_output=True, text=True)
+    if r.returncode:
+        return None
+    m = re.search(r'comment "([^"]*)"', r.stdout)
+    if not m or m.group(1) == "-":
+        return []
+    return m.group(1).split()
+
+
+def apply(block):
+    v4, v6 = [], []
+    for s in block:
+        for cidr in s["block"].split(","):
+            cidr = cidr.strip()
+            if cidr:
+                net = ipaddress.ip_network(cidr, strict=False)
+                (v4 if net.version == 4 else v6).append(str(net))
+
+    def elements(nets):
+        return f" elements = {{ {', '.join(nets)} }};" if nets else ""
+
+    tokens = " ".join(s["token"] for s in block)
+    script = "\n".join([
+        f"table inet {TABLE} {{}}",
+        f"delete table inet {TABLE}",
+        f"table inet {TABLE} {{",
+        f"  set v4 {{ type ipv4_addr; flags interval; auto-merge;{elements(v4)} }}",
+        f"  set v6 {{ type ipv6_addr; flags interval; auto-merge;{elements(v6)} }}",
+        "  chain out {",
+        "    type filter hook output priority 0; policy accept;",
+        f'    ip daddr @v4 udp dport 1024-65535 counter drop comment "{tokens or "-"}"',
+        "    ip6 daddr @v6 udp dport 1024-65535 counter drop",
+        "  }",
+        "}",
+    ]) + "\n"
+    nft(script)
+
+    if block:
+        print(f"{NO} {bold('blocked')} {len(block)} server(s)  {dim(f'{len(v4)} v4 / {len(v6)} v6 ranges')}")
+        print("  " + "  ".join(red(s["token"]) for s in block))
+    else:
+        print(f"{OK} nothing blocked")
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+def cmd_list(_):
+    servers = fetch()
+    current = blocked_tokens()
+    with ThreadPoolExecutor(len(servers)) as ex:
+        pings = list(ex.map(ping, [s["ping"] for s in servers]))
+    rows = sorted(zip(servers, pings), key=lambda r: (r[1] is None, r[1] or 0))
+
+    print()
+    print(dim(f"   {'server':<7}  {'region':<17}  {'ping':>6}"))
+    for s, ms in rows:
+        blocked = current is not None and s["token"] in current
+        mark = dim("·") if current is None else NO if blocked else OK
+        tok = dim(s["token"]) if blocked else blue(s["token"])
+        p, plain = ping_text(ms)
+        print(f" {mark} {pad(tok, s['token'], 7)}  {pretty(s['title']):<17}  "
+              f"{pad(p, plain, 6, right=True)}  {ping_bar(ms)}")
+    print()
+    if current is None:
+        print(dim("   no blocks active (or root needed)"))
+    else:
+        print(f"   {OK} {len(servers) - len(current)} allowed   {NO} {len(current)} blocked")
+    print()
+
+
+def cmd_allow(names):
+    servers = fetch()
+    keep = {s["token"] for s in resolve(servers, names)}
+    apply([s for s in servers if s["token"] not in keep])
+
+
+def cmd_block(names):
+    apply(resolve(fetch(), names))
+
+
+def cmd_off(_):
+    remove_table()
+    print(f"{OK} all blocks removed")
+
+
+def cmd_status(_):
+    cur = blocked_tokens()
+    if cur is None:
+        print(dim("no blocks active (or root needed to read state)"))
+    elif cur:
+        print(f"{NO} {bold('blocked')}  " + "  ".join(red(t) for t in cur))
+    else:
+        print(f"{OK} nothing blocked")
+
+
+def cmd_update(_):
+    print(f"{OK} {len(fetch(force=True))} servers cached {dim(str(CACHE))}")
+
+
+# name: (handler, needs server args, arg hint, description)
+COMMANDS = {
+    "list":   (cmd_list,   False, "",            "show server list"),
+    "allow":  (cmd_allow,  True,  "ord1 las1 …", "block every server except these"),
+    "block":  (cmd_block,  True,  "gsg1 …",      "block only these servers"),
+    "off":    (cmd_off,    False, "",            "remove all blocks"),
+    "status": (cmd_status, False, "",            "show what is currently blocked"),
+    "update": (cmd_update, False, "",            "refresh the ip list"),
+}
+ALIASES = {"reset": "off", "clear": "off"}
+
+
+def usage():
+    print()
+    emblem("     ")
+    print(f"\n {bold(orange(PROG))} {dim('— Overwatch server selector for Linux')}\n")
+    for name, (_, _, hint, desc) in COMMANDS.items():
+        print(f"   {bold(white(name))}{' ' * (6 - len(name))} {pad(blue(hint), hint, 12)}  {dim(desc)}")
+    servers = cached_servers()
+    if servers:
+        print(f"\n {bold('servers')}")
+        for i in range(0, len(servers), 3):
+            print("   " + "".join(
+                f"{pad(blue(s['token']), s['token'], 6)} {pretty(s['title']):<17}"
+                for s in servers[i:i + 3]))
+    else:
+        print(dim(f"\n run `{PROG} list` to see server tokens"))
+    print()
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        usage()
+        return
+    name, rest = ALIASES.get(args[0], args[0]), args[1:]
+    if name not in COMMANDS:
+        die(f"unknown command `{args[0]}` (try `{PROG} help`)")
+    handler, needs_args, _, _ = COMMANDS[name]
+    if needs_args and not rest:
+        die(f"`{PROG} {name}` needs at least one server token")
+    handler(rest)
+
+
+if __name__ == "__main__":
+    main()
