@@ -4,6 +4,9 @@ A simple terminal-based server selector for Overwatch on Linux, uses firewall ru
 
 Concept and ip ranges yoinked from this project: [stowmyy/dropship](https://github.com/stowmyy/dropship).
 
+<img width="1099" height="728" alt="screenshot" src="https://github.com/user-attachments/assets/d72689fb-b608-4349-bea3-d5aabc5b57f4" />
+
+
 ## Requirements
 
 - Linux with nftables 0.9 or newer (`nft`)
@@ -40,30 +43,12 @@ owblock off                  # remove all blocks
 owblock update               # re-download the server list
 ```
 
-Make sure Overwatch is closed while using commands.
+***Make sure Overwatch is closed while using the tool!***
 
-Rules will reset when the system reboots, run the command again to re-add them.
+Rules will reset when the system reboots, run the command again to re-add them, or create an autoexec on your system.
 
-Don't use the practice range to test if the blocks worked!!!
-The practice range is weird and doesnt use the same servers afaik, instead either play a qp match or create a custom game.
-
-## How it works
-
-`owblock` creates one nftables table, `inet owblock`, that drops **outbound
-UDP to ports 1024–65535** for the blocked servers' IP ranges. The game uses
-UDP for its traffic, so it can't reach those servers. Websites hosted in the
-same cloud regions keep working, because they use TCP and aren't affected.
-
-Every change replaces the whole table, and the rules are never saved to disk.
-A reboot or `owblock off` removes them completely. You can inspect them at any
-time:
-
-```sh
-sudo nft list table inet owblock
-```
-
-The server list is cached at `~/.cache/owblock/ips.json`, so `owblock` still
-works if the download fails.
+Don't use the practice range to test it,
+the practice range is weird and doesnt use the same servers afaik, instead either play a qp match or create a custom game.
 
 ## Credits
 
