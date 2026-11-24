@@ -9,10 +9,9 @@ Concept and ip ranges yoinked from this awesome project: [stowmyy/dropship](http
 
 ## Requirements
 
-- Linux with nftables 0.9 or newer (`nft`)
-- Python 3.6 or newer (standard library only)
-- `sudo` or `doas`, or run it as root
-- `ping`
+- nftables 0.9 or newer (`nft`)
+- Python 3.6 or newer
+
 
 It doesn't matter which firewall you already use. `owblock` keeps its rules in
 its own table, so it works alongside ufw, firewalld, or no firewall at all.
