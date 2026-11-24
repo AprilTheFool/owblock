@@ -13,7 +13,7 @@ Concept and ip ranges yoinked from this awesome project: [stowmyy/dropship](http
 - Python 3.6 or newer
 
 
-It doesn't matter which firewall you already use. `owblock` keeps its rules in
+It doesn't matter which firewall you use. owblock keeps its rules in
 its own table, so it works alongside ufw, firewalld, or no firewall at all.
 
 ## Install
